@@ -41,6 +41,9 @@ canvas{width:100%;max-width:320px;aspect-ratio:9/16;background:#000;border-radiu
     <label for="model">Model</label>
     <input id="model" type="text" value="gemini-3.5-flash" autocomplete="off">
     <p class="note">If you get a 404 or "model not found" error, change this to gemini-flash-latest.</p>
+    <label for="tts">Voice model</label>
+    <input id="tts" type="text" value="gemini-3.1-flash-tts-preview" autocomplete="off">
+    <p class="note">If the voice fails with 404, try gemini-2.5-flash-preview-tts.</p>
   </details>
 
   <label for="topic">Topic or idea</label>
@@ -58,16 +61,23 @@ canvas{width:100%;max-width:320px;aspect-ratio:9/16;background:#000;border-radiu
   <label for="pics">Your photos (optional, used as backgrounds)</label>
   <input id="pics" type="file" accept="image/*" multiple>
 
+  <div class="row">
+    <div><label for="voice">AI voice</label>
+      <select id="voice"><option value="">Off (captions only)</option><option value="Kore" selected>Kore (female)</option><option value="Puck">Puck (male)</option></select></div>
+    <div><label for="music">Music</label>
+      <select id="music"><option value="chill" selected>Chill</option><option value="upbeat">Upbeat</option><option value="">None</option></select></div>
+  </div>
+
   <p id="msg" role="status"></p>
   <div class="row"><button id="go">Make video</button></div>
 
   <div id="stage">
     <canvas id="cv" width="540" height="960"></canvas>
     <div class="row" style="margin-top:12px">
-      <button id="play" class="alt">Play with voice</button>
+      <button id="play" class="alt">Play</button>
       <button id="rec">Download video</button>
     </div>
-    <p class="note">The downloaded video has captions but no voice (browsers cannot record the voice). Use Play with voice to preview narration.</p>
+    <p class="note">The downloaded video includes the AI voice and music when they are turned on.</p>
   </div>
 </main>
 
@@ -118,16 +128,69 @@ function drawScene(i, p){
   cx.fillStyle = '#fff'; cx.fillRect(40, H - 60, (W - 80) * ((i + p) / scenes.length), 6);
 }
 
-function run(voice, onEnd){
-  cancelAnimationFrame(raf); speechSynthesis.cancel(); playing = true;
-  let i = 0, t0 = performance.now(), dur = scenes[0].dur;
-  const speak = k => { if(!voice) return; const u = new SpeechSynthesisUtterance(scenes[k].narration || scenes[k].caption); u.rate = 1; u.lang = $('#lang').value === 'English' ? 'en-US' : 'fil-PH'; speechSynthesis.speak(u); };
-  speak(0);
+let ac = null, bus = null, mon = null, recDest = null, srcs = [], recording = false;
+function audioInit(){
+  if(ac){ if(ac.state === 'suspended') ac.resume(); return; }
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  bus = ac.createGain(); mon = ac.createGain(); recDest = ac.createMediaStreamDestination();
+  bus.connect(recDest); bus.connect(mon); mon.connect(ac.destination);
+}
+function stopAudio(){ srcs.forEach(x => { try{ x.stop(); }catch(e){} }); srcs = []; speechSynthesis.cancel(); }
+function playMusic(kind, start, total){
+  if(!kind) return;
+  const g = ac.createGain(); g.gain.value = kind === 'upbeat' ? 0.07 : 0.05; g.connect(bus);
+  const chords = [[261.6, 329.6, 392], [220, 261.6, 329.6], [174.6, 220, 261.6], [196, 246.9, 392]];
+  const step = kind === 'upbeat' ? 0.3 : 0.6, notes = Math.ceil(total / step);
+  for(let k = 0; k < notes; k++){
+    const ch = chords[Math.floor(k * step / 2.4) % 4], f = ch[k % 3] * (k % 8 === 7 ? 2 : 1), t = start + k * step;
+    const o = ac.createOscillator(), e = ac.createGain();
+    o.type = 'triangle'; o.frequency.value = f;
+    e.gain.setValueAtTime(0, t); e.gain.linearRampToValueAtTime(1, t + 0.03); e.gain.exponentialRampToValueAtTime(0.001, t + step * 1.6);
+    o.connect(e); e.connect(g); o.start(t); o.stop(t + step * 1.7); srcs.push(o);
+  }
+}
+async function tts(text, voice){
+  const key = $('#key').value.trim(), model = $('#tts').value.trim() || 'gemini-3.1-flash-tts-preview';
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: 'Say in a warm, cheerful tone: ' + text }] }],
+      generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } })
+  });
+  const j = await r.json();
+  if(!r.ok) throw new Error((j.error && j.error.message) || 'Voice request failed');
+  const part = j.candidates[0].content.parts.find(x => x.inlineData), d = part.inlineData;
+  const rate = +((/rate=(\d+)/.exec(d.mimeType || '') || [])[1] || 24000);
+  const bin = atob(d.data), n = bin.length >> 1, buf = ac.createBuffer(1, n, rate), ch = buf.getChannelData(0);
+  for(let k = 0; k < n; k++){ let v = bin.charCodeAt(2 * k) | (bin.charCodeAt(2 * k + 1) << 8); if(v > 32767) v -= 65536; ch[k] = v / 32768; }
+  return buf;
+}
+
+function run(audio, onEnd){
+  cancelAnimationFrame(raf); stopAudio(); playing = true;
+  const total = scenes.reduce((a, x) => a + x.dur, 0) / 1000;
+  if(audio){
+    audioInit(); const start = ac.currentTime + 0.15; let at = start;
+    playMusic($('#music').value, start, total + 0.5);
+    scenes.forEach(x => {
+      if(x.buf){ const b = ac.createBufferSource(); b.buffer = x.buf; b.connect(bus); b.start(at + 0.1); srcs.push(b); }
+      at += x.dur / 1000;
+    });
+  }
+  const say = k => {
+    if(!audio || recording || scenes[k].buf || $('#voice').value) return;
+    const u = new SpeechSynthesisUtterance(scenes[k].narration || scenes[k].caption);
+    u.lang = $('#lang').value === 'English' ? 'en-US' : 'fil-PH'; speechSynthesis.speak(u);
+  };
+  let i = 0, t0 = performance.now(), dur = scenes[0].dur; say(0);
   const step = now => {
     if(!playing) return;
     const p = Math.min(1, (now - t0) / dur);
     drawScene(i, p);
-    if(p >= 1){ i++; if(i >= scenes.length){ playing = false; onEnd && onEnd(); return; } t0 = now; dur = scenes[i].dur; speak(i); }
+    if(p >= 1){
+      i++;
+      if(i >= scenes.length){ playing = false; onEnd && onEnd(); setTimeout(stopAudio, 450); return; }
+      t0 = now; dur = scenes[i].dur; say(i);
+    }
     raf = requestAnimationFrame(step);
   };
   raf = requestAnimationFrame(step);
@@ -136,10 +199,13 @@ function run(voice, onEnd){
 async function ask(){
   const key = $('#key').value.trim(), model = $('#model').value.trim() || 'gemini-3.5-flash';
   const lang = $('#lang').value, style = $('#style').value, n = $('#n').value, topic = $('#topic').value.trim();
-  const prompt = `Write a short vertical video script in ${lang}. Style: ${style}. Topic: ${topic}. Exactly ${n} scenes. Reply ONLY with JSON: an array of objects {"caption": max 9 words shown on screen, "narration": one short spoken sentence, "emoji": one emoji}. No markdown.`;
+  const guide = lang === 'Bisaya'
+    ? ' Write in natural, casual Cebuano (Bisaya) as a local in Cebu or Davao would post on Facebook. Use short, simple, everyday sentences and common words (lami, barato, suki, dali, kaayo, naa, wala, unta, mao nga, karon). Do NOT use Tagalog words: use "kaayo" not "talaga", "naa" not "mayroon", "unsa" not "ano", "wala" not "hindi". English words for modern things (promo, order, online, load) are fine. Example tone: "Lami ug barato! Mag-order na karon."'
+    : lang === 'Tagalog' ? ' Write in natural, casual Tagalog (light Taglish is fine), short simple sentences.' : '';
+  const prompt = `Write a short vertical video script in ${lang}.${guide} Style: ${style}. Topic: ${topic}. Exactly ${n} scenes. Reply ONLY with JSON: an array of objects {"caption": max 9 words shown on screen, "narration": one short spoken sentence, "emoji": one emoji}. No markdown.`;
   const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json' } })
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.6 } })
   });
   const j = await r.json();
   if(!r.ok) throw new Error((j.error && j.error.message) || 'Request failed');
@@ -153,10 +219,19 @@ async function ask(){
 $('#go').onclick = async () => {
   if(!$('#key').value.trim()){ $('#setup').open = true; msg('Add your Gemini key first.'); return; }
   if(!$('#topic').value.trim()){ msg('Type a topic first.'); return; }
-  $('#go').disabled = true; msg('Writing script...'); playing = false;
+  $('#go').disabled = true; msg('Writing script...'); playing = false; stopAudio(); audioInit();
+  let verr = '';
   try{
-    scenes = await ask(); msg('');
-    $('#stage').classList.add('on'); run(false);
+    scenes = await ask();
+    const v = $('#voice').value;
+    if(v){
+      for(let k = 0; k < scenes.length; k++){
+        msg('Making voice ' + (k + 1) + '/' + scenes.length + '...');
+        try{ const b = await tts(scenes[k].narration, v); scenes[k].buf = b; scenes[k].dur = Math.max(3000, b.duration * 1000 + 700); }
+        catch(e){ verr = 'AI voice failed (' + e.message + '). Showing captions only.'; break; }
+      }
+    }
+    msg(verr); $('#stage').classList.add('on'); run(true);
   }catch(e){ msg('Failed: ' + e.message + '. Check the key and model name.'); }
   $('#go').disabled = false;
 };
@@ -166,17 +241,20 @@ $('#play').onclick = () => { if(scenes.length) run(true); };
 $('#rec').onclick = () => {
   if(!scenes.length) return;
   if(!window.MediaRecorder){ msg('This browser cannot record video. Try Chrome.'); return; }
-  const st = cv.captureStream(30);
-  const mt = ['video/webm;codecs=vp9', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t));
+  audioInit();
+  const st = new MediaStream([...cv.captureStream(30).getVideoTracks(), ...recDest.stream.getAudioTracks()]);
+  const mt = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t));
   const rc = new MediaRecorder(st, mt ? { mimeType: mt } : undefined), parts = [];
   rc.ondataavailable = e => { if(e.data.size) parts.push(e.data); };
   rc.onstop = () => {
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(parts, { type: 'video/webm' }));
     a.download = 'video.webm'; document.body.appendChild(a); a.click(); a.remove();
+    mon.gain.value = 1; recording = false;
     $('#rec').disabled = false; $('#rec').textContent = 'Download video'; msg('');
   };
   $('#rec').disabled = true; $('#rec').textContent = 'Recording...'; msg('Recording, wait until it finishes.');
-  rc.start(); run(false, () => setTimeout(() => rc.stop(), 300));
+  mon.gain.value = 0; recording = true; rc.start();
+  run(true, () => setTimeout(() => rc.stop(), 400));
 };
 </script>
 </body>
