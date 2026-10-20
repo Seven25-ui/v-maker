@@ -58,8 +58,8 @@ canvas{width:100%;max-width:320px;aspect-ratio:9/16;background:#000;border-radiu
       <select id="n"><option>4</option><option selected>5</option><option>6</option><option>8</option></select></div>
   </div>
 
-  <label for="pics">Your photos (optional, used as backgrounds)</label>
-  <input id="pics" type="file" accept="image/*" multiple>
+  <label for="pics">Your photos or videos (optional, used as backgrounds)</label>
+  <input id="pics" type="file" accept="image/*,video/*" multiple>
 
   <div class="row">
     <div><label for="voice">AI voice</label>
@@ -95,7 +95,13 @@ $('#key').oninput = keep; $('#model').oninput = keep;
 
 $('#pics').onchange = e => {
   imgs = [];
-  [...e.target.files].slice(0, 8).forEach(f => { const i = new Image(); i.onload = () => imgs.push(i); i.src = URL.createObjectURL(f); });
+  [...e.target.files].slice(0, 8).forEach(f => {
+    if(f.type.startsWith('video/')){
+      const v = document.createElement('video');
+      v.muted = true; v.loop = true; v.playsInline = true; v.src = URL.createObjectURL(f);
+      v.onloadeddata = () => { v.play().catch(() => {}); imgs.push(v); };
+    } else { const i = new Image(); i.onload = () => imgs.push(i); i.src = URL.createObjectURL(f); }
+  });
 };
 
 function wrap(t, maxW){
@@ -108,8 +114,11 @@ function drawScene(i, p){
   const s = scenes[i], pal = PAL[i % PAL.length];
   if(imgs.length){
     const im = imgs[i % imgs.length], z = 1 + p * 0.08;
-    const r = Math.max(W / im.width, H / im.height) * z, w = im.width * r, h = im.height * r;
-    cx.drawImage(im, (W - w) / 2, (H - h) / 2, w, h);
+    const iw = im.videoWidth || im.width, ih = im.videoHeight || im.height;
+    if(iw && ih){
+      const r = Math.max(W / iw, H / ih) * z, w = iw * r, h = ih * r;
+      cx.drawImage(im, (W - w) / 2, (H - h) / 2, w, h);
+    }
     cx.fillStyle = 'rgba(0,0,0,.45)'; cx.fillRect(0, 0, W, H);
   } else {
     const g = cx.createLinearGradient(0, 0, W * (0.4 + p * 0.6), H);
