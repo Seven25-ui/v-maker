@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Maker</title>
+<style>
+:root{--bg:#0f1b2b;--ink:#e8eef4;--mute:#9fb2c4;--card:#172538;--line:#2b3d52;--acc:#ff6a2b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:20px 16px 48px}
+main{max-width:560px;margin:0 auto}
+h1{margin:6px 0 2px;font-size:1.8rem}
+.sub{color:var(--mute);margin:0 0 18px}
+label{display:block;font-weight:600;margin:12px 0 4px}
+input,select,textarea{font:inherit;width:100%;padding:11px 12px;border-radius:10px;border:1.5px solid var(--line);background:var(--card);color:var(--ink)}
+textarea{min-height:84px;resize:vertical}
+.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1 1 140px}
+button{font:inherit;font-weight:700;border:0;border-radius:10px;padding:12px 16px;cursor:pointer;background:var(--acc);color:#fff}
+button.alt{background:var(--card);color:var(--ink);border:1.5px solid var(--line)}
+button:disabled{opacity:.5;cursor:not-allowed}
+:focus-visible{outline:3px solid #5aa9ff;outline-offset:2px}
+details{background:var(--card);border:1.5px solid var(--line);border-radius:12px;padding:12px 14px;margin:14px 0}
+summary{cursor:pointer;font-weight:600}
+.note{color:var(--mute);font-size:.85rem;margin:8px 0}
+#msg{min-height:1.4em;color:#ffb4a8;margin:10px 0}
+#stage{display:none;margin-top:16px;text-align:center}
+#stage.on{display:block}
+canvas{width:100%;max-width:320px;aspect-ratio:9/16;background:#000;border-radius:14px;border:1.5px solid var(--line)}
+.imgs{font-size:.85rem;color:var(--mute)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Video Maker</h1>
+  <p class="sub">Type a topic. AI writes the scenes, your browser makes the video. Free.</p>
+
+  <details id="setup">
+    <summary>One-time setup: free Gemini key</summary>
+    <p class="note">Get a free key at aistudio.google.com (Get API key). It is saved only in this browser.</p>
+    <input id="key" type="password" placeholder="Gemini API key" autocomplete="off">
+    <label for="model">Model</label>
+    <input id="model" type="text" value="gemini-3.5-flash" autocomplete="off">
+    <p class="note">If you get a 404 or "model not found" error, change this to gemini-flash-latest.</p>
+  </details>
+
+  <label for="topic">Topic or idea</label>
+  <textarea id="topic" placeholder="e.g. 3 tips to make your sari-sari store sell more"></textarea>
+
+  <div class="row">
+    <div><label for="lang">Language</label>
+      <select id="lang"><option>Bisaya</option><option>Tagalog</option><option>English</option></select></div>
+    <div><label for="style">Style</label>
+      <select id="style"><option>Promo</option><option>Facts</option><option>Story</option></select></div>
+    <div><label for="n">Scenes</label>
+      <select id="n"><option>4</option><option selected>5</option><option>6</option><option>8</option></select></div>
+  </div>
+
+  <label for="pics">Your photos (optional, used as backgrounds)</label>
+  <input id="pics" type="file" accept="image/*" multiple>
+
+  <p id="msg" role="status"></p>
+  <div class="row"><button id="go">Make video</button></div>
+
+  <div id="stage">
+    <canvas id="cv" width="540" height="960"></canvas>
+    <div class="row" style="margin-top:12px">
+      <button id="play" class="alt">Play with voice</button>
+      <button id="rec">Download video</button>
+    </div>
+    <p class="note">The downloaded video has captions but no voice (browsers cannot record the voice). Use Play with voice to preview narration.</p>
+  </div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const cv = $('#cv'), cx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+const PAL = [['#ff6a2b','#7a1fa2'],['#00b4d8','#023e8a'],['#f72585','#3a0ca3'],['#2ec4b6','#1b3a4b'],['#ffb703','#c1121f'],['#80ed99','#22577a']];
+let scenes = [], imgs = [], playing = false, raf = 0;
+const msg = t => { $('#msg').textContent = t || ''; };
+
+try{ const s = JSON.parse(localStorage.getItem('vm') || '{}'); if(s.k) $('#key').value = s.k; if(s.m) $('#model').value = s.m; }catch(e){}
+const keep = () => { try{ localStorage.setItem('vm', JSON.stringify({ k: $('#key').value.trim(), m: $('#model').value.trim() })); }catch(e){} };
+$('#key').oninput = keep; $('#model').oninput = keep;
+
+$('#pics').onchange = e => {
+  imgs = [];
+  [...e.target.files].slice(0, 8).forEach(f => { const i = new Image(); i.onload = () => imgs.push(i); i.src = URL.createObjectURL(f); });
+};
+
+function wrap(t, maxW){
+  const words = t.split(/\s+/), lines = []; let cur = '';
+  words.forEach(w => { const test = cur ? cur + ' ' + w : w; if(cx.measureText(test).width > maxW && cur){ lines.push(cur); cur = w; } else cur = test; });
+  if(cur) lines.push(cur); return lines;
+}
+
+function drawScene(i, p){
+  const s = scenes[i], pal = PAL[i % PAL.length];
+  if(imgs.length){
+    const im = imgs[i % imgs.length], z = 1 + p * 0.08;
+    const r = Math.max(W / im.width, H / im.height) * z, w = im.width * r, h = im.height * r;
+    cx.drawImage(im, (W - w) / 2, (H - h) / 2, w, h);
+    cx.fillStyle = 'rgba(0,0,0,.45)'; cx.fillRect(0, 0, W, H);
+  } else {
+    const g = cx.createLinearGradient(0, 0, W * (0.4 + p * 0.6), H);
+    g.addColorStop(0, pal[0]); g.addColorStop(1, pal[1]); cx.fillStyle = g; cx.fillRect(0, 0, W, H);
+    cx.font = '200px serif'; cx.textAlign = 'center'; cx.globalAlpha = .9;
+    cx.fillText(s.emoji || '\u2728', W / 2, H * 0.3 + Math.sin(p * 6) * 8); cx.globalAlpha = 1;
+  }
+  const a = Math.min(1, p * 6);
+  cx.textAlign = 'center'; cx.fillStyle = '#fff'; cx.globalAlpha = a;
+  cx.shadowColor = 'rgba(0,0,0,.6)'; cx.shadowBlur = 12;
+  cx.font = '800 54px system-ui,sans-serif';
+  const lines = wrap(s.caption, W - 100), lh = 66, y0 = H * 0.62 - (lines.length * lh) / 2 + (1 - a) * 30;
+  lines.forEach((l, k) => cx.fillText(l, W / 2, y0 + k * lh));
+  cx.shadowBlur = 0; cx.globalAlpha = 1;
+  cx.fillStyle = 'rgba(255,255,255,.25)'; cx.fillRect(40, H - 60, W - 80, 6);
+  cx.fillStyle = '#fff'; cx.fillRect(40, H - 60, (W - 80) * ((i + p) / scenes.length), 6);
+}
+
+function run(voice, onEnd){
+  cancelAnimationFrame(raf); speechSynthesis.cancel(); playing = true;
+  let i = 0, t0 = performance.now(), dur = scenes[0].dur;
+  const speak = k => { if(!voice) return; const u = new SpeechSynthesisUtterance(scenes[k].narration || scenes[k].caption); u.rate = 1; u.lang = $('#lang').value === 'English' ? 'en-US' : 'fil-PH'; speechSynthesis.speak(u); };
+  speak(0);
+  const step = now => {
+    if(!playing) return;
+    const p = Math.min(1, (now - t0) / dur);
+    drawScene(i, p);
+    if(p >= 1){ i++; if(i >= scenes.length){ playing = false; onEnd && onEnd(); return; } t0 = now; dur = scenes[i].dur; speak(i); }
+    raf = requestAnimationFrame(step);
+  };
+  raf = requestAnimationFrame(step);
+}
+
+async function ask(){
+  const key = $('#key').value.trim(), model = $('#model').value.trim() || 'gemini-3.5-flash';
+  const lang = $('#lang').value, style = $('#style').value, n = $('#n').value, topic = $('#topic').value.trim();
+  const prompt = `Write a short vertical video script in ${lang}. Style: ${style}. Topic: ${topic}. Exactly ${n} scenes. Reply ONLY with JSON: an array of objects {"caption": max 9 words shown on screen, "narration": one short spoken sentence, "emoji": one emoji}. No markdown.`;
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json' } })
+  });
+  const j = await r.json();
+  if(!r.ok) throw new Error((j.error && j.error.message) || 'Request failed');
+  const txt = j.candidates[0].content.parts.map(p => p.text || '').join('').replace(/```json|```/g, '').trim();
+  let arr = JSON.parse(txt);
+  if(arr && !Array.isArray(arr)) arr = Object.values(arr).find(Array.isArray);
+  if(!Array.isArray(arr) || !arr.length) throw new Error('Empty script');
+  return arr.map(s => ({ caption: String(s.caption || ''), narration: String(s.narration || s.caption || ''), emoji: s.emoji, dur: 3200 }));
+}
+
+$('#go').onclick = async () => {
+  if(!$('#key').value.trim()){ $('#setup').open = true; msg('Add your Gemini key first.'); return; }
+  if(!$('#topic').value.trim()){ msg('Type a topic first.'); return; }
+  $('#go').disabled = true; msg('Writing script...'); playing = false;
+  try{
+    scenes = await ask(); msg('');
+    $('#stage').classList.add('on'); run(false);
+  }catch(e){ msg('Failed: ' + e.message + '. Check the key and model name.'); }
+  $('#go').disabled = false;
+};
+
+$('#play').onclick = () => { if(scenes.length) run(true); };
+
+$('#rec').onclick = () => {
+  if(!scenes.length) return;
+  if(!window.MediaRecorder){ msg('This browser cannot record video. Try Chrome.'); return; }
+  const st = cv.captureStream(30);
+  const mt = ['video/webm;codecs=vp9', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t));
+  const rc = new MediaRecorder(st, mt ? { mimeType: mt } : undefined), parts = [];
+  rc.ondataavailable = e => { if(e.data.size) parts.push(e.data); };
+  rc.onstop = () => {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(parts, { type: 'video/webm' }));
+    a.download = 'video.webm'; document.body.appendChild(a); a.click(); a.remove();
+    $('#rec').disabled = false; $('#rec').textContent = 'Download video'; msg('');
+  };
+  $('#rec').disabled = true; $('#rec').textContent = 'Recording...'; msg('Recording, wait until it finishes.');
+  rc.start(); run(false, () => setTimeout(() => rc.stop(), 300));
+};
+</script>
+</body>
+</html>
